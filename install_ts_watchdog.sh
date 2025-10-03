@@ -1,101 +1,74 @@
-#!/usr/bin/env bash
-# install_ts_watchdog.sh — final authoritative + resilient
-
-set -euo pipefail
-[ "${EUID:-$(id -u)}" -ne 0 ] && exec sudo -E bash "$0" "$@"
-
-stamp(){ date +%Y%m%d-%H%M%S; }
-bk(){ [ -e "$1" ] && cp -a "$1" "$1.bak.$(stamp)" || true; }
-
-echo "== Backups =="
-mkdir -p /etc/systemd/system/tailscaled.service.d
-bk /usr/local/bin/tailscale-watchdog.sh
-bk /etc/systemd/system/tailscale-watchdog.service
-bk /etc/systemd/system/tailscale-watchdog.timer
-bk /etc/systemd/system/tailscaled.service.d/override.conf
-
-echo "== Watchdog script =="
-install -m 0755 /dev/stdin /usr/local/bin/tailscale-watchdog.sh <<'EOF'
+sudo tee /usr/local/bin/tailscale-watchdog.sh >/dev/null <<'EOF'
 #!/bin/bash
-# tailscale-watchdog.sh — aggressive health check (resilient restart)
-set -e
+set -euo pipefail
 
-log(){ echo "$(date -Is) - $*"; }
-restart_tailscale(){
-  log "Watchdog: restarting tailscaled" | tee -a /var/log/tailscale-watchdog.log
+LOGF=/var/log/tailscale-watchdog.log
+STATE_DIR=/run/tailscale-watchdog
+STATE_FAILCOUNT="$STATE_DIR/failcount"
+STATE_LAST="$STATE_DIR/last"
+DERP_CHECK=${DERP_CHECK:-0}        # set to 1 to also ICMP 100.100.100.100
+FAILS_TO_RESTART=${FAILS_TO_RESTART:-3}   # was 2; bump to 3 to reduce flaps
+RETRY_DELAY=${RETRY_DELAY:-15}            # seconds to re-check before counting a FAIL
+
+mkdir -p "$STATE_DIR"
+
+log(){ echo "$(date -Is) - $*" >> "$LOGF"; }
+
+restart(){
+  log "Watchdog: restarting tailscaled"
   systemctl restart tailscaled || { sleep 2; systemctl restart tailscaled; } || true
 }
 
-# 1) daemon present?
-pgrep -x tailscaled >/dev/null || { restart_tailscale; exit 0; }
+# one-shot check helper with single retry after RETRY_DELAY
+check_or_retry(){
+  local desc="$1"; shift
+  if "$@"; then return 0; fi
+  sleep "$RETRY_DELAY"
+  "$@" && return 0
+  log "FAIL: $desc"
+  return 1
+}
 
-# 2) CLI responsive?
-tailscale status --peers=false >/dev/null 2>&1 || { restart_tailscale; exit 0; }
+record_fail_and_maybe_restart(){
+  local n=0; [[ -f "$STATE_FAILCOUNT" ]] && n=$(cat "$STATE_FAILCOUNT" 2>/dev/null || echo 0)
+  n=$((n+1)); echo "$n" > "$STATE_FAILCOUNT"
+  echo "unhealthy" > "$STATE_LAST"
+  if (( n >= FAILS_TO_RESTART )); then
+    : > "$STATE_FAILCOUNT"
+    restart
+  fi
+  exit 0
+}
 
-# 3) interface has IPv4?
-ip addr show tailscale0 2>/dev/null | grep -q "inet " || { restart_tailscale; exit 0; }
+recover(){
+  if [[ -f "$STATE_LAST" ]] && grep -qx unhealthy "$STATE_LAST"; then
+    log "Recovered: Tailscale healthy"
+  fi
+  : > "$STATE_FAILCOUNT" || true
+  echo "healthy" > "$STATE_LAST"
+  exit 0
+}
 
-# 4) control/DERP reachable?
-ping -c 1 -W 2 100.100.100.100 >/dev/null 2>&1 || { restart_tailscale; exit 0; }
+# ---- Gates (cheap → expensive) ----
+check_or_retry "G1: tailscaled not running" pgrep -x tailscaled >/dev/null || record_fail_and_maybe_restart
 
-log "Tailscale healthy" | tee -a /var/log/tailscale-watchdog.log
-EOF
-touch /var/log/tailscale-watchdog.log && chmod 0644 /var/log/tailscale-watchdog.log
+TSBIN=$(command -v tailscale || true)
+check_or_retry "G2: tailscale CLI missing" test -n "$TSBIN" || record_fail_and_maybe_restart
 
-echo "== Watchdog service & timer =="
-cat >/etc/systemd/system/tailscale-watchdog.service <<'EOF'
-[Unit]
-Description=Tailscale Watchdog (health check & auto-restart)
-After=network-online.target
-Wants=network-online.target
+# Use Tailscale's own view first
+ts4="$("$TSBIN" ip -4 2>/dev/null | head -n1 || true)"
+check_or_retry "G2: tailscale ip -4 returned empty" test -n "$ts4" || record_fail_and_maybe_restart
 
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/tailscale-watchdog.sh
-EOF
+# Cross-check OS interface only if the above succeeded
+check_or_retry "G3: tailscale0 missing IPv4" bash -c "ip -4 addr show dev tailscale0 | grep -q 'inet '" || record_fail_and_maybe_restart
 
-cat >/etc/systemd/system/tailscale-watchdog.timer <<'EOF'
-[Unit]
-Description=Run Tailscale Watchdog every minute
+# Optional DERP reachability
+if [[ "$DERP_CHECK" == "1" ]]; then
+  check_or_retry "G5: DERP ICMP 100.100.100.100 failed" ping -c1 -W2 100.100.100.100 >/dev/null 2>&1 || record_fail_and_maybe_restart
+fi
 
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=1min
-AccuracySec=1s
-Persistent=true
-Unit=tailscale-watchdog.service
-
-[Install]
-WantedBy=timers.target
-EOF
-
-echo "== tailscaled override (resilient ExecStartPost) =="
-cat >/etc/systemd/system/tailscaled.service.d/override.conf <<'EOF'
-[Unit]
-StartLimitIntervalSec=0
-StartLimitBurst=0
-
-[Service]
-Environment="TS_DEBUG_DISABLE_UDP=true"
-Restart=always
-RestartSec=10
-# Retry once after 2s; ignore failure to avoid marking service failed
-ExecStartPost=/bin/sh -c '/usr/bin/tailscale up --accept-dns --netfilter-mode=off || { sleep 2; /usr/bin/tailscale up --accept-dns --netfilter-mode=off; } || true'
+recover
 EOF
 
-echo "== Reload & enable =="
-systemctl daemon-reload
-systemctl enable --now tailscaled >/dev/null 2>&1 || true
-systemctl restart tailscaled
-systemctl enable --now tailscale-watchdog.timer
-
-echo "== Verify =="
-echo "- tailscale version:"; tailscale version || true
-echo "- watchdog hash:"; sha256sum /usr/local/bin/tailscale-watchdog.sh
-echo "- tailscaled status (expect Connected):"
-systemctl status tailscaled --no-pager | sed -n '1,18p'
-echo "- watchdog timer:"
-systemctl status tailscale-watchdog.timer --no-pager | sed -n '1,14p'
-echo "- watchdog one-off run:"; /usr/local/bin/tailscale-watchdog.sh || true
-tail -n 5 /var/log/tailscale-watchdog.log || true
-echo "Done."
+sudo chmod 0755 /usr/local/bin/tailscale-watchdog.sh
+sudo systemctl restart tailscale-watchdog.timer
